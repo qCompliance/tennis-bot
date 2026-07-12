@@ -91,27 +91,51 @@ async function shot(page, name) {
   catch (e) { log('screenshot failed', name, e.message); }
 }
 
+/** True once the user menu / basket appears in the navbar. */
+async function isLoggedIn(page) {
+  const t = (await page.locator('body').innerText().catch(() => '')) || '';
+  return /BASKET/i.test(t) && !/^\s*$/.test(t);
+}
+
 async function login(page) {
   await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 60000 });
-  await page.waitForTimeout(1500);
-  // Already logged in? (LOGIN link absent)
-  const loginLink = page.locator('a:visible, button:visible', { hasText: /^\s*LOGIN\s*$/i }).first();
-  if (await loginLink.count() === 0) { log('Already logged in'); return; }
-  await loginLink.click();
-  const user = page.getByPlaceholder('Member ID');
-  await user.waitFor({ state: 'visible', timeout: 15000 });
-  await user.fill(process.env.CLUB_USER);
-  await page.locator('input[type="password"]:visible').fill(process.env.CLUB_PASS);
-  await shot(page, '01-login-filled');
-  // The blue "Login" button inside the modal
-  await page.locator('.btn:visible', { hasText: /Login/ }).first().click();
   await page.waitForTimeout(2500);
-  // Verify: LOGIN link gone / user menu present
-  if (await page.locator('a:visible, button:visible', { hasText: /^\s*LOGIN\s*$/i }).count() > 0) {
-    await shot(page, '01-login-failed');
-    throw new Error('Login appears to have failed');
+  if (await isLoggedIn(page)) { log('Already logged in'); return; }
+
+  // Open the login modal (JS click — this site ignores synthetic mouse clicks)
+  const loginLink = page.locator('a:has-text("LOGIN"), button:has-text("LOGIN")').first();
+  await loginLink.waitFor({ state: 'attached', timeout: 15000 });
+  await loginLink.evaluate(n => n.click());
+
+  const user = page.getByPlaceholder('Member ID');
+  await user.waitFor({ state: 'visible', timeout: 20000 });
+  await user.click();
+  await user.fill(process.env.CLUB_USER);
+  const pw = page.locator('input[type="password"]:visible').first();
+  await pw.click();
+  await pw.fill(process.env.CLUB_PASS);
+  await shot(page, '01-login-filled');
+
+  // Submit via JS click on the modal's Login button (class "onenter"), fallback: Enter key
+  const submit = page.locator('span.btn:has-text("Login"), button.btn:has-text("Login")').first();
+  if (await submit.count() > 0) await submit.evaluate(n => n.click());
+  else await pw.press('Enter');
+
+  // Poll up to 15s for the navbar to switch to logged-in state
+  for (let i = 0; i < 15; i++) {
+    await page.waitForTimeout(1000);
+    if (await isLoggedIn(page)) { log('Logged in OK'); return; }
   }
-  log('Logged in OK');
+  // One retry: press Enter in the password field if the modal is still there
+  if (await pw.isVisible().catch(() => false)) {
+    await pw.press('Enter');
+    for (let i = 0; i < 10; i++) {
+      await page.waitForTimeout(1000);
+      if (await isLoggedIn(page)) { log('Logged in OK (retry)'); return; }
+    }
+  }
+  await shot(page, '01-login-failed');
+  throw new Error('Login appears to have failed');
 }
 
 /** Find the target session row. Returns a Locator or null. */
