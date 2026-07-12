@@ -1,0 +1,73 @@
+# .github/workflows/tennis-bot.yml
+name: Tennis session auto-registration
+
+on:
+  schedule:
+    # Tuesday & Thursday night runs. 22:15 UTC = 23:15 London in summer (BST),
+    # 22:15 London in winter (GMT). The script itself waits for London midnight.
+    - cron: '15 22 * * 2'   # Tuesday night  -> books Wednesday 10:00 session
+    - cron: '15 22 * * 4'   # Thursday night -> books Friday 10:00 session
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (stop before payment, empty basket)'
+        type: boolean
+        default: true
+      target:
+        description: 'Which session (auto = by weekday)'
+        type: choice
+        options: [auto, wed, fri]
+        default: auto
+
+concurrency:
+  group: tennis-booking
+  cancel-in-progress: false
+
+jobs:
+  book:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm init -y >/dev/null
+          npm install playwright@1.56.0 >/dev/null
+          npx playwright install --with-deps chromium
+
+      - name: Run registration bot
+        env:
+          CLUB_USER: ${{ secrets.CLUB_USER }}
+          CLUB_PASS: ${{ secrets.CLUB_PASS }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '' }}
+          TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'auto' }}
+          WAITLIST_OK: '1'
+        run: node register.js
+
+      - name: Upload screenshots & result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ github.run_id }}
+          path: out/
+
+      - name: Notify by issue (GitHub emails you)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let result = 'unknown';
+            try { result = fs.readFileSync('out/result.txt', 'utf8').trim(); } catch {}
+            const ok = '${{ job.status }}' === 'success';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `${ok ? '✅' : '❌'} Tennis booking ${ok ? 'succeeded' : 'FAILED'} — ${new Date().toLocaleDateString('en-GB', {timeZone:'Europe/London'})}`,
+              body: `Result: \`${result}\`\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nScreenshots are attached as artifacts on the run page.`
+            });
