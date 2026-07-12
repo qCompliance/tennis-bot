@@ -19,6 +19,10 @@ on:
         options: [auto, wed, fri]
         default: auto
 
+permissions:
+  contents: read
+  issues: write
+
 concurrency:
   group: tennis-booking
   cancel-in-progress: false
@@ -32,7 +36,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
 
       - name: Install Playwright
         run: |
