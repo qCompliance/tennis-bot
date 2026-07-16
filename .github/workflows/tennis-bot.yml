@@ -3,10 +3,11 @@ name: Tennis session auto-registration
 
 on:
   schedule:
-    # Tuesday & Thursday night runs. 22:15 UTC = 23:15 London in summer (BST),
-    # 22:15 London in winter (GMT). The script itself waits for London midnight.
-    - cron: '15 22 * * 2'   # Tuesday night  -> books Wednesday 10:00 session
-    - cron: '15 22 * * 4'   # Thursday night -> books Friday 10:00 session
+    # Tuesday & Thursday night runs. GitHub cron can start up to ~1h late, so the
+    # primary run starts extra early and a backup run follows. The script itself
+    # waits for London midnight, and exits harmlessly if already registered.
+    - cron: '30 21 * * 2,4'  # primary: 22:30 London (BST) Tue & Thu nights
+    - cron: '45 22 * * 2,4'  # backup:  23:45 London (BST) Tue & Thu nights
   workflow_dispatch:
     inputs:
       dry_run:
