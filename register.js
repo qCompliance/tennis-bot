@@ -19,6 +19,7 @@ const { chromium } = require('playwright');
 const fs = require('fs');
 
 const BASE = 'https://paddington.clubsolution.co.uk/newlook/proc_liste.asp';
+const KURV = 'https://paddington.clubsolution.co.uk/newlook/proc_kurv.asp';
 const CLASS_NAME = 'Level 3 - Coaching Group';
 const OUT_DIR = process.env.OUT_DIR || 'out';
 
@@ -138,6 +139,27 @@ async function login(page) {
   throw new Error('Login appears to have failed');
 }
 
+/** Clear any leftover items in the basket (e.g. from a previous crashed run). */
+async function emptyBasketIfNeeded(page) {
+  await page.goto(KURV, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(1500);
+  const body = (await page.locator('body').innerText().catch(() => '')) || '';
+  if (/Your Basket is empty/i.test(body)) { log('Basket check: empty'); return; }
+  log('WARN: basket not empty — clearing leftover items');
+  await shot(page, '00-basket-leftover');
+  await page.evaluate(() => {
+    const b = [...document.querySelectorAll('button, span, a')].find(e => /Empty Basket/i.test(e.textContent || '') && e.offsetParent);
+    if (b) b.click();
+  });
+  await page.waitForTimeout(1500);
+  await page.evaluate(() => {
+    const ok = [...document.querySelectorAll('button, a, span')].find(el => /^\s*OK\s*$/.test(el.textContent || '') && el.offsetParent);
+    if (ok) ok.click();
+  });
+  await page.waitForTimeout(1500);
+  await shot(page, '00-basket-cleared');
+}
+
 /** Find the target session row. Returns a Locator or null. */
 function targetRow(page, dateStr) {
   return page.locator('tr.infinite-item')
@@ -175,13 +197,20 @@ async function checkout(page, dateStr, dryRun) {
   if (!body.includes(CLASS_NAME)) throw new Error('Basket does not contain the expected class');
   if (!new RegExp(dateStr.split(' ')[1]).test(body)) log('WARN: basket date check inconclusive');
 
-  // Tick the T&C checkbox
-  const tc = page.locator('input[type="checkbox"]').filter({ has: page.locator(':scope') });
-  // find checkbox nearest the "I have read and accept" label
-  const label = page.locator('text=/I have read and accept/i').first();
-  await label.waitFor({ timeout: 10000 });
-  const cb = page.locator('input[type="checkbox"]:visible').last();
-  if (!(await cb.isChecked())) await cb.evaluate(n => { n.click(); });
+  // Tick the T&C checkbox. NOTE: it's #acc_beting, a 0x0 opacity-0 input —
+  // invisible to :visible filters, so it must be JS-clicked directly.
+  const tickResult = await page.evaluate(() => {
+    let cb = document.querySelector('#acc_beting');
+    if (!cb) {
+      cb = [...document.querySelectorAll('input[type="checkbox"]')].find(b =>
+        /I have read and accept/i.test(((b.closest('label,div,td,p') || {}).textContent) || ''));
+    }
+    if (!cb) return 'not-found';
+    if (!cb.checked) cb.click();
+    return cb.checked ? 'checked' : 'failed-to-check';
+  });
+  log('T&C checkbox:', tickResult);
+  if (tickResult !== 'checked') throw new Error('Could not tick T&C checkbox: ' + tickResult);
   await page.waitForTimeout(500);
 
   if (dryRun) {
@@ -197,10 +226,16 @@ async function checkout(page, dateStr, dryRun) {
     return 'dry-run-ok';
   }
 
-  // PAY with card on file
-  const payBtn = page.locator('.btn:visible', { hasText: /Use your card/i }).first();
-  await payBtn.waitFor({ timeout: 10000 });
-  await payBtn.evaluate(n => n.click());
+  // PAY with card on file (JS click; page has hidden responsive duplicates)
+  const payResult = await page.evaluate(() => {
+    const els = [...document.querySelectorAll('.btn, button, span, a')]
+      .filter(e => /Use your card/i.test(e.textContent || '') && (e.textContent || '').trim().length < 25);
+    const target = els.find(e => e.offsetParent) || els[0];
+    if (!target) return 'not-found';
+    target.click();
+    return 'clicked';
+  });
+  if (payResult !== 'clicked') throw new Error('"Use your card" button not found');
   log('Clicked "Use your card"');
   await page.waitForTimeout(6000);
   await shot(page, '04-after-payment');
@@ -235,6 +270,9 @@ async function checkout(page, dateStr, dryRun) {
 
   try {
     await login(page);
+    await emptyBasketIfNeeded(page);
+    await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForTimeout(1500);
     await shot(page, '02-list');
 
     // -------- poll loop --------
@@ -252,11 +290,19 @@ async function checkout(page, dateStr, dryRun) {
       if (state === 'book') {
         log('BOOK button present — booking now');
         await jsClickInRow(row, 'span.onenter', /^\s*Book\s*$/);
-        try {
-          result = await checkout(page, dateStr, dryRun);
-        } catch (e) {
-          log('Checkout error:', e.message); await shot(page, 'err-checkout');
-          result = 'checkout-failed';
+        for (let tryNo = 1; tryNo <= 2 && !result; tryNo++) {
+          try {
+            result = await checkout(page, dateStr, dryRun);
+          } catch (e) {
+            log(`Checkout attempt ${tryNo} error:`, e.message);
+            await shot(page, `err-checkout-${tryNo}`);
+            if (tryNo === 1) {
+              // item should still be in the basket — reload it and retry once
+              try { await page.goto(KURV, { waitUntil: 'domcontentloaded', timeout: 45000 }); await page.waitForTimeout(1500); } catch {}
+            } else {
+              result = 'checkout-failed';
+            }
+          }
         }
         break;
       }
@@ -279,6 +325,12 @@ async function checkout(page, dateStr, dryRun) {
       }
 
       if (state === 'missing') log('WARN: target row not found in list');
+
+      if (dryRun && state === 'notopen') {
+        log('DRY RUN: registration for the target session is not open yet — stopping here (login, basket check and session detection all verified).');
+        result = 'dry-run-ok';
+        break;
+      }
 
       // adaptive polling: tight around midnight, relaxed before
       const wait = toMid > 600 ? 60 : toMid > 90 ? 15 : toMid > 8 ? 5 : 2;
