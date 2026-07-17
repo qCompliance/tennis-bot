@@ -27,7 +27,7 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 // ---------- London-time helpers ----------
 function londonNow() {
-  // Returns {y,m,d,hh,mm,ss,weekday, dateObj} for current Europe/London wall time
+  // Returns {y,m,d,hh,mm,ss,weekday} for current Europe/London wall time
   const fmt = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short', hour12: false,
@@ -226,25 +226,47 @@ async function checkout(page, dateStr, dryRun) {
     return 'dry-run-ok';
   }
 
-  // PAY with card on file (JS click; page has hidden responsive duplicates)
-  const payResult = await page.evaluate(() => {
-    const els = [...document.querySelectorAll('.btn, button, span, a')]
-      .filter(e => /Use your card/i.test(e.textContent || '') && (e.textContent || '').trim().length < 25);
-    const target = els.find(e => e.offsetParent) || els[0];
-    if (!target) return 'not-found';
-    target.click();
-    return 'clicked';
-  });
-  if (payResult !== 'clicked') throw new Error('"Use your card" button not found');
-  log('Clicked "Use your card"');
-  await page.waitForTimeout(6000);
+  // COMPLETE the booking. The action button that appears depends on the account
+  // balance and only renders AFTER an async balance check — so poll for it:
+  //   - "Confirm Booking"   => the prepaid balance covers the fee (pay from balance)
+  //   - "Use your card"     => pay with the saved card
+  //   - "Proceed to Payment"=> generic checkout (card) fallback
+  // Preference order per user: use balance if available, else card.
+  const PAY_LABELS = ['Confirm Booking', 'Use your card', 'Proceed to Payment'];
+  let clicked = null;
+  for (let i = 0; i < 50 && !clicked; i++) {      // up to ~25s
+    clicked = await page.evaluate((labels) => {
+      for (const label of labels) {
+        const el = [...document.querySelectorAll('.btn, button, span, a')]
+          .find(e => new RegExp('^\\s*' + label + '\\s*$', 'i').test((e.textContent || '').trim()) && e.offsetParent);
+        if (el) { el.click(); return label; }
+      }
+      return null;
+    }, PAY_LABELS);
+    if (!clicked) await page.waitForTimeout(500);
+  }
+  if (!clicked) { await shot(page, '04-no-pay-button'); throw new Error('No payment/confirm button appeared'); }
+  log('Clicked payment action:', clicked);
+  await page.waitForTimeout(4000);
   await shot(page, '04-after-payment');
 
-  // Success heuristics: basket empty / receipt / no longer on kurv with item
-  const after = (await page.locator('body').innerText()).replace(/\s+/g, ' ');
-  if (/receipt|thank you|confirmed|Your Basket is empty/i.test(after)) return 'paid';
-  // Possibly a payment-gateway page appeared; give it time and screenshot
-  await page.waitForTimeout(10000);
+  // Some flows pop an "OK"/confirm dialog after the action button — accept it.
+  await page.evaluate(() => {
+    const ok = [...document.querySelectorAll('button, a, span')]
+      .find(el => /^\s*(OK|Confirm|Yes)\s*$/i.test((el.textContent || '').trim()) && el.offsetParent);
+    if (ok) ok.click();
+  });
+  await page.waitForTimeout(4000);
+
+  // Success heuristics: booked / receipt / basket empty / now on waiting-or-signed list
+  for (let i = 0; i < 10; i++) {
+    const after = (await page.locator('body').innerText().catch(() => '')).replace(/\s+/g, ' ');
+    if (/receipt|thank you|confirmed|booking confirmed|Your Basket is empty|You are signed up/i.test(after)) {
+      await shot(page, '05-confirmed');
+      return 'paid';
+    }
+    await page.waitForTimeout(1500);
+  }
   await shot(page, '05-payment-late');
   return 'paid-unverified';
 }
