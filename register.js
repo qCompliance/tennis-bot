@@ -341,6 +341,7 @@ async function checkout(page, dateStr, dryRun) {
       const toMid = secsToMidnightLondon();
       log(`#${attempt} state=${state} (${toMid}s to London midnight)`);
       if (state === 'signedup') { result = waitlisted ? 'promoted-from-waitlist' : 'already-booked'; break; }
+      if (dryRun && state === 'on-waitlist') { log('DRY RUN: already on the waiting list - stopping.'); result = 'dry-run-ok'; break; }
       if (state === 'book') {
         log('BOOK button present — booking now');
         await jsClickInRow(row, 'span.onenter', /^\s*Book\s*$/);
