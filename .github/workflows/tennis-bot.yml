@@ -1,12 +1,19 @@
 # .github/workflows/tennis-bot.yml
 name: Tennis session auto-registration
+
 on:
   schedule:
-    # Tuesday & Thursday night runs. GitHub cron can start up to ~1h late, so the
-    # primary run starts extra early and a backup run follows. The script itself
-    # waits for London midnight, and exits harmlessly if already registered.
-    - cron: '30 21 * * 2,4'  # primary: 22:30 London (BST) Tue & Thu nights
-    - cron: '45 22 * * 2,4'  # backup:  23:45 London (BST) Tue & Thu nights
+    # Tuesday & Thursday night runs. GitHub's scheduler can start jobs HOURS late
+    # under load (observed ~2h20m on 2026-08-07, which pushed the run past midnight
+    # and lost the session). Defence: fire several evening windows so at least one
+    # run is already sitting in its midnight-wait even if GitHub is 2+ hours behind.
+    # The concurrency lock below serialises them, so only the FIRST run books; the
+    # rest start after midnight, see "already registered", and exit — no double-book.
+    # (Times are UTC; London is BST/UTC+1 in summer.)
+    - cron: '0 19 * * 2,4'   # ~20:00 London — earliest guard against late scheduling
+    - cron: '0 20 * * 2,4'   # ~21:00 London
+    - cron: '0 21 * * 2,4'   # ~22:00 London
+    - cron: '30 22 * * 2,4'  # ~23:30 London — last window before midnight
   workflow_dispatch:
     inputs:
       dry_run:
@@ -18,26 +25,32 @@ on:
         type: choice
         options: [auto, wed, fri]
         default: auto
+
 permissions:
   contents: read
   issues: write
+
 concurrency:
   group: tennis-booking
   cancel-in-progress: false
+
 jobs:
   book:
     runs-on: ubuntu-latest
-    timeout-minutes: 170
+    timeout-minutes: 360   # allow an early-evening run to wait through to midnight
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+
       - name: Install Playwright
         run: |
           npm init -y >/dev/null
           npm install playwright@1.56.0 >/dev/null
           npx playwright install --with-deps chromium
+
       - name: Run registration bot
         env:
           CLUB_USER: ${{ secrets.CLUB_USER }}
@@ -45,14 +58,15 @@ jobs:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '' }}
           TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'auto' }}
           WAITLIST_OK: '1'
-          POLL_ABORT_MIN: '75'
         run: node register.js
+
       - name: Upload screenshots & result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: run-${{ github.run_id }}
           path: out/
+
       - name: Notify by issue (GitHub emails you)
         if: always()
         uses: actions/github-script@v7
@@ -60,24 +74,11 @@ jobs:
           script: |
             const fs = require('fs');
             let result = 'unknown';
-            try { result = fs.readFileSync('out/result.txt', 'utf8').trim().split('\n')[0]; } catch {}
-            // Title reflects the ACTUAL outcome, not just the job exit status:
-            //   booked / already booked / promoted  -> BOOKED
-            //   verified waiting-list registration  -> WAITLISTED (not a booking!)
-            //   dry run                             -> DRY-RUN OK
-            //   anything else                       -> FAILED
-            const booked = ['paid', 'already-booked', 'promoted-from-waitlist'].some(p => result.startsWith(p));
-            const waitl = result.startsWith('waitlist-joined');
-            const dry = result.startsWith('dry-run');
-            const emoji = booked ? '✅' : dry ? '🧪' : waitl ? '⏳' : '❌';
-            const word = booked ? 'Tennis booking BOOKED'
-                       : dry    ? 'Tennis bot dry-run OK'
-                       : waitl  ? 'Tennis WAITLISTED only — no spot won'
-                       :          'Tennis booking FAILED';
-            const day = new Date().toLocaleDateString('en-GB', { timeZone: 'Europe/London' });
+            try { result = fs.readFileSync('out/result.txt', 'utf8').trim(); } catch {}
+            const ok = '${{ job.status }}' === 'success';
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `${emoji} ${word} — ${day}`,
-              body: `Result: \`${result}\`\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nScreenshots are attached as artifacts on the run page.\n\n${waitl ? '> **Note:** a waiting-list spot converts by email notification to the club account inbox (Jaehee), up to 3 hours before the class. Watch that inbox.' : ''}`
+              title: `${ok ? '✅' : '❌'} Tennis booking ${ok ? 'succeeded' : 'FAILED'} — ${new Date().toLocaleDateString('en-GB', {timeZone:'Europe/London'})}`,
+              body: `Result: \`${result}\`\n\nRun: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nScreenshots are attached as artifacts on the run page.`
             });
