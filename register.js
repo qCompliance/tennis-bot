@@ -193,33 +193,41 @@ async function jsClickInRow(row, selector, hasText) {
  * stopped there, so the registration was never submitted. This clicks through.
  * Returns a status string for the log; the caller verifies on a fresh load.
  */
-async function joinWaitlist(page, row) {
+async function joinWaitlist(page, row, dateStr) {
+  // 1) open the waiting-list dialog from the class row
   await jsClickInRow(row, 'span.onenter', /Waiting list/);
-  await page.waitForTimeout(1500);
-  const status = await page.evaluate(() => {
-    // Find the dialog: the smallest visible container holding the dialog text
-    const containers = [...document.querySelectorAll('div, section, form')]
-      .filter(d => d.offsetParent &&
-        /waiting list (booking|registration)/i.test(d.textContent || ''));
-    if (!containers.length) return 'dialog-not-found';
-    containers.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
-    const dlg = containers[0];
-    // Pick the widest activation window offered (prefer "3 hours")
-    const opt = [...dlg.querySelectorAll('button, span, a, label')]
-      .find(e => /^\s*3 hours\s*$/i.test((e.textContent || '').trim()) && e.offsetParent);
+  await page.waitForTimeout(2000);
+  // 2) in the "Waiting List Booking" modal: choose the widest activation window,
+  //    then click the modal's OWN Book button. Scope to the modal that also holds
+  //    a Cancel button (the footer) so we don't miss it (was: too-narrow scope).
+  const st = await page.evaluate(() => {
+    const vis = el => el && el.offsetParent;
+    const cancel = [...document.querySelectorAll('.btn, button, span, a')]
+      .find(e => /^\s*Cancel\s*$/i.test((e.textContent || '').trim()) && vis(e));
+    let dlg = null;
+    for (let n = cancel; n && !dlg; n = n.parentElement) {
+      if (/Waiting List Booking|before the class begins/i.test(n.textContent || '')) dlg = n;
+    }
+    const scope = dlg || document;
+    const opt = [...scope.querySelectorAll('button, span, a, label')]
+      .find(e => /^\s*3 hours\s*$/i.test((e.textContent || '').trim()) && vis(e));
     if (opt) opt.click();
-    // Confirm with the dialog's own Book button (not Cancel, not a row button)
-    const book = [...dlg.querySelectorAll('.btn, button, span, a')]
-      .find(e => {
-        const t = (e.textContent || '').trim();
-        return /Book/i.test(t) && t.length <= 10 && !/Cancel/i.test(t) && e.offsetParent;
-      });
+    const book = [...scope.querySelectorAll('.btn, button, span, a')]
+      .find(e => /^\s*Book\s*$/i.test((e.textContent || '').trim()) && vis(e) && !e.closest('tr.infinite-item'));
     if (!book) return 'book-button-not-found';
     book.click();
     return 'submitted';
   });
-  await page.waitForTimeout(2500);
-  return status;
+  if (st !== 'submitted') return st;
+  // 3) the waitlist item is now in the basket — complete the (refundable) payment
+  //    using the same checkout flow as a normal booking.
+  try {
+    return await checkout(page, dateStr, false);
+  } catch (e) {
+    log('Waitlist checkout error:', e.message);
+    await shot(page, 'err-waitlist-checkout');
+    return 'waitlist-checkout-failed';
+  }
 }
 async function checkout(page, dateStr, dryRun) {
   // We should now be on proc_kurv.asp (basket)
@@ -372,7 +380,7 @@ async function checkout(page, dateStr, dryRun) {
         if (wlJoinTries >= 2) { result = 'waitlist-join-FAILED'; break; }
         wlJoinTries++;
         log(`Session full — joining waiting list (attempt ${wlJoinTries})`);
-        const st = await joinWaitlist(page, row);
+        const st = await joinWaitlist(page, row, dateStr);
         log('Waitlist dialog:', st);
         await shot(page, `03-waitlist-join-${wlJoinTries}`);
         // verification happens on the next iteration's fresh page load
