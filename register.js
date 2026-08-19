@@ -385,7 +385,17 @@ async function checkout(page, dateStr, dryRun) {
         await shot(page, `03-waitlist-join-${wlJoinTries}`);
         // verification happens on the next iteration's fresh page load
       }
-      if (state === 'missing') log('WARN: target row not found in list');
+      if (state === 'missing') {
+        log('WARN: target row not found in list');
+        // Session still not even listed well after midnight => never published
+        // for this date. Stop cleanly instead of polling (and failing) for hours.
+        const sinceMid = 86400 - toMid;
+        if (sinceMid > 600 && sinceMid < 5400) {
+          log(`Target session still not listed ${Math.round(sinceMid / 60)} min after midnight — not published; stopping.`);
+          result = 'session-not-listed';
+          break;
+        }
+      }
       if (dryRun && state === 'notopen') {
         log('DRY RUN: registration for the target session is not open yet — stopping here (login, basket check and session detection all verified).');
         result = 'dry-run-ok';
@@ -407,7 +417,7 @@ async function checkout(page, dateStr, dryRun) {
     if (!result) result = waitlisted ? 'waitlist-joined' : 'gave-up';
     log('RESULT:', result);
     fs.writeFileSync(`${OUT_DIR}/result.txt`, `${result}\n${CLASS_NAME} ${dateStr}\n`);
-    const ok = ['paid', 'paid-unverified', 'dry-run-ok', 'already-booked', 'promoted-from-waitlist', 'waitlist-joined'].includes(result);
+    const ok = ['paid', 'paid-unverified', 'dry-run-ok', 'already-booked', 'promoted-from-waitlist', 'waitlist-joined', 'session-not-listed'].includes(result);
     await browser.close();
     process.exit(ok ? 0 : 1);
   } catch (e) {
