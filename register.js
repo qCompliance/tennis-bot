@@ -1,39 +1,45 @@
 /*
  * Paddington Sports Club — tennis session auto-registration bot
  *
- * Books the "Level 3 - Coaching Group" session (Wed or Fri 10:00-12:00)
- * the moment registration opens (midnight Europe/London, 7 days ahead).
+ * Books the "Level 3 - Coaching Group" sessions (Wed and/or Fri 10:00-12:00).
  *
- * PATCHED 2026-07-25:
- *  - FIX: waiting-list join now confirms the dialog's Book button (was left open)
- *  - FIX: waiting-list join is VERIFIED on a fresh page load before reporting success
- *  - FIX: "You are signed up" no longer conflates class signup with waitlist signup
- *  - NEW: after a verified waitlist join, keep watching for freed spots (churn)
- *    until POLL_ABORT_MIN past midnight, and book instantly if one appears
- *  - Faster endgame: 1s polling in the last 30s before midnight, reduced settle
+ * REDESIGNED 2026-09-16:
+ *  - Sessions here become bookable ~2 weeks ahead (NOT in a seconds-long window
+ *    at midnight/10:00). The old "poll for an opening instant then give up" model
+ *    chased a moment that never comes and produced constant false-failure emails.
+ *  - New model: every run, scan the class list for the target weekday Level 3
+ *    sessions within the horizon and BOOK any that are currently bookable and not
+ *    already booked. Run this several times a day so new sessions get grabbed soon
+ *    after they open.
+ *  - "Nothing to book" (all already booked, or none open yet) is SUCCESS, not a
+ *    failure. Only genuine errors (login/checkout/fatal) fail the run.
  *
  * Env vars:
  *   CLUB_USER      Member ID (required)
  *   CLUB_PASS      Password  (required)
- *   TARGET         "wed" | "fri" | "auto"  (default: auto — Tue run books Wed, Thu run books Fri)
- *   DRY_RUN        "1" = go all the way to checkout but DO NOT pay; empties basket instead
- *   WAITLIST_OK    "1" = if session is already full, join the waiting list instead
- *   POLL_ABORT_MIN minutes past midnight to give up (default 75)
+ *   TARGET         "wed" | "fri" | "both"  (default: both)
+ *   HORIZON_DAYS   how many days ahead to book (default 15 — covers ~2 weeks)
+ *   DRY_RUN        "1" = go all the way to checkout but DO NOT pay; empties basket
+ *   WAITLIST_OK    "1" = if a target session is already full, join the waiting list
+ *                  (a refundable fee applies). Default OFF.
  *
- * Exit codes: 0 = booked (or dry-run ok / already booked / verified waitlist), 1 = failed/gave up
+ * Exit codes: 0 = ran cleanly (booked something OR nothing to do), 1 = real error.
  */
 const { chromium } = require('playwright');
 const fs = require('fs');
+
 const BASE = 'https://paddington.clubsolution.co.uk/newlook/proc_liste.asp';
 const KURV = 'https://paddington.clubsolution.co.uk/newlook/proc_kurv.asp';
 const CLASS_NAME = 'Level 3 - Coaching Group';
 const OUT_DIR = process.env.OUT_DIR || 'out';
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
+
 // ---------- London-time helpers ----------
 function londonNow() {
   // Returns {y,m,d,hh,mm,ss,weekday} for current Europe/London wall time
   const fmt = new Intl.DateTimeFormat('en-GB', {
-    timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit',
+    year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit', second: '2-digit', weekday: 'short', hour12: false,
   });
   const parts = Object.fromEntries(fmt.formatToParts(new Date()).map(p => [p.type, p.value]));
@@ -50,57 +56,39 @@ function addDays(y, m, d, n) {
            weekday: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][dt.getUTCDay()] };
 }
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-/** Decide which session date we are booking. */
-function computeTarget() {
-  const envTarget = (process.env.TARGET || 'auto').toLowerCase();
+
+/** Row-matching string like "Wed 23. Sep 2026". */
+const rowDateString = t => `${t.weekday} ${t.d}. ${MONTHS[t.m - 1]} ${t.y}`;
+
+/** All target session date strings within the horizon (chronological). */
+function targetDateStrings() {
+  const envTarget = (process.env.TARGET || 'both').toLowerCase();
+  const wantWed = envTarget === 'both' || envTarget === 'wed';
+  const wantFri = envTarget === 'both' || envTarget === 'fri';
+  const horizon = +(process.env.HORIZON_DAYS || 15);
   const now = londonNow();
-  let wantedDay; // "Wed" or "Fri"
-  if (envTarget === 'wed') wantedDay = 'Wed';
-  else if (envTarget === 'fri') wantedDay = 'Fri';
-  else {
-    // auto: registration opens 10:00 the SAME weekday, 7 days before the session,
-    // so a Wed-morning run books the next Wed and a Fri-morning run books the next Fri.
-    if (now.weekday === 'Wed') wantedDay = 'Wed';
-    else if (now.weekday === 'Fri') wantedDay = 'Fri';
-    else throw new Error(`TARGET=auto but today (${now.weekday} London) is not a scheduled run day`);
-  }
-  // The newly-openable session is the wantedDay that lies 7 or 8 days ahead
-  for (const n of [7, 8]) {
-    const cand = addDays(now.y, now.m, now.d, n);
-    if (cand.weekday === wantedDay) return cand;
-  }
-  // Fallback (dry-run testing on off-schedule days): nearest upcoming wantedDay
-  if (process.env.DRY_RUN === '1') {
-    for (let n = 1; n <= 6; n++) {
-      const cand = addDays(now.y, now.m, now.d, n);
-      if (cand.weekday === wantedDay) { log('DRY RUN fallback target (already-open session)'); return cand; }
+  const out = [];
+  for (let n = 1; n <= horizon; n++) {
+    const c = addDays(now.y, now.m, now.d, n);
+    if ((wantWed && c.weekday === 'Wed') || (wantFri && c.weekday === 'Fri')) {
+      out.push(rowDateString(c));
     }
   }
-  throw new Error('Could not compute target date');
+  return out;
 }
-/** Row-matching string like "Wed 22. Jul 2026" (as shown in the class list). */
-const rowDateString = t => `${t.weekday} ${t.d}. ${MONTHS[t.m - 1]} ${t.y}`;
-/** Seconds until next midnight in Europe/London (approx, wall-clock based). */
-function secsToMidnightLondon() {
-  // NOTE: despite the name, returns seconds until the next 10:00 London — the
-  // moment club registration opens (7 days before each 10:00 session). Keeping the
-  // name lets the poll loop, deadline and grace logic re-anchor to the 10:00 open.
-  const OPEN_HH = 10;
-  const n = londonNow();
-  let s = ((OPEN_HH - 1 - n.hh) * 3600) + ((59 - n.mm) * 60) + (60 - n.ss);
-  if (s <= 0) s += 86400;
-  return s;
-}
+
 // ---------- page helpers ----------
 async function shot(page, name) {
   try { await page.screenshot({ path: `${OUT_DIR}/${name}.png`, fullPage: true }); }
   catch (e) { log('screenshot failed', name, e.message); }
 }
+
 /** True once the user menu / basket appears in the navbar. */
 async function isLoggedIn(page) {
   const t = (await page.locator('body').innerText().catch(() => '')) || '';
   return /BASKET/i.test(t) && !/^\s*$/.test(t);
 }
+
 async function login(page) {
   await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 60000 });
   await page.waitForTimeout(2500);
@@ -137,6 +125,7 @@ async function login(page) {
   await shot(page, '01-login-failed');
   throw new Error('Login appears to have failed');
 }
+
 /** Clear any leftover items in the basket (e.g. from a previous crashed run). */
 async function emptyBasketIfNeeded(page) {
   await page.goto(KURV, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -157,23 +146,43 @@ async function emptyBasketIfNeeded(page) {
   await page.waitForTimeout(1500);
   await shot(page, '00-basket-cleared');
 }
-/** Find the target session row. Returns a Locator or null. */
+
+/** Load the class list and scroll to lazy-load rows until every wanted date
+ *  string is present, or row count stops growing. */
+async function loadListCovering(page, wantedDateStrs) {
+  await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  await page.waitForTimeout(1500);
+  let lastCount = -1, stable = 0;
+  for (let i = 0; i < 30; i++) {
+    const body = (await page.locator('body').innerText().catch(() => '')) || '';
+    if (wantedDateStrs.length && wantedDateStrs.every(ds => body.includes(ds))) break;
+    const count = await page.locator('tr.infinite-item').count();
+    if (count === lastCount) { if (++stable >= 3) break; }
+    else { stable = 0; lastCount = count; }
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    await page.waitForTimeout(700);
+  }
+}
+
+/** Find the target session row. Returns a Locator. */
 function targetRow(page, dateStr) {
   return page.locator('tr.infinite-item')
     .filter({ hasText: CLASS_NAME })
     .filter({ hasText: dateStr })
     .first();
 }
+
 /**
  * Classify the row's state.
  *   signedup    = booked into the class (done!)
  *   book        = a Book button is present (spot available — grab it)
- *   on-waitlist = we are registered on the waiting list (keep watching)
+ *   on-waitlist = we are registered on the waiting list
  *   waitlist    = class full, waiting-list button offered (join it)
- *   notopen     = row exists but booking not open yet
+ *   full        = fully booked, waiting list also full (nothing to do)
+ *   notopen     = row exists but no actionable control yet
  *   missing     = row not found
- * NOTE: order matters — "book" is checked before "on-waitlist" so that a freed
- * spot is grabbed even when we are already on the waiting list.
+ * NOTE: "book" is checked before "on-waitlist" so a freed spot is grabbed even
+ * when we are already on the waiting list.
  */
 async function rowState(page, dateStr) {
   const row = targetRow(page, dateStr);
@@ -185,28 +194,25 @@ async function rowState(page, dateStr) {
   if (/You are signed up for Waiting List/i.test(text)) return { state: 'on-waitlist', row, text };
   const hasWl = await row.locator('span.onenter', { hasText: /Waiting list/ }).count() > 0;
   if (hasWl) return { state: 'waitlist', row, text };
+  if (/Fully booked/i.test(text)) return { state: 'full', row, text };
   return { state: 'notopen', row, text };
 }
+
 /** JS-click an element inside the row (native clicks are flaky on this site). */
 async function jsClickInRow(row, selector, hasText) {
   const el = row.locator(selector, { hasText }).first();
   await el.waitFor({ state: 'attached', timeout: 5000 });
   await el.evaluate(node => node.click());
 }
+
 /**
- * Join the waiting list PROPERLY:
- * clicking the row's "Waiting list" button only OPENS a dialog ("Waiting List
- * Booking") with activation-window choices and its own Book button. The old code
- * stopped there, so the registration was never submitted. This clicks through.
- * Returns a status string for the log; the caller verifies on a fresh load.
+ * Join the waiting list PROPERLY: clicking the row's "Waiting list" button only
+ * OPENS a dialog with activation-window choices and its own Book button; this
+ * clicks through and then completes the (refundable) checkout.
  */
 async function joinWaitlist(page, row, dateStr) {
-  // 1) open the waiting-list dialog from the class row
   await jsClickInRow(row, 'span.onenter', /Waiting list/);
   await page.waitForTimeout(2000);
-  // 2) in the "Waiting List Booking" modal: choose the widest activation window,
-  //    then click the modal's OWN Book button. Scope to the modal that also holds
-  //    a Cancel button (the footer) so we don't miss it (was: too-narrow scope).
   const st = await page.evaluate(() => {
     const vis = el => el && el.offsetParent;
     const cancel = [...document.querySelectorAll('.btn, button, span, a')]
@@ -226,8 +232,6 @@ async function joinWaitlist(page, row, dateStr) {
     return 'submitted';
   });
   if (st !== 'submitted') return st;
-  // 3) the waitlist item is now in the basket — complete the (refundable) payment
-  //    using the same checkout flow as a normal booking.
   try {
     return await checkout(page, dateStr, false);
   } catch (e) {
@@ -236,6 +240,7 @@ async function joinWaitlist(page, row, dateStr) {
     return 'waitlist-checkout-failed';
   }
 }
+
 async function checkout(page, dateStr, dryRun) {
   // We should now be on proc_kurv.asp (basket)
   await page.waitForURL(/proc_kurv\.asp/i, { timeout: 20000 });
@@ -273,9 +278,9 @@ async function checkout(page, dateStr, dryRun) {
   }
   // COMPLETE the booking. The action button that appears depends on the account
   // balance and only renders AFTER an async balance check — so poll for it:
-  //   - "Confirm Booking"   => the prepaid balance covers the fee (pay from balance)
-  //   - "Use your card"     => pay with the saved card
-  //   - "Proceed to Payment"=> generic checkout (card) fallback
+  //   - "Confirm Booking"    => the prepaid balance covers the fee (pay from balance)
+  //   - "Use your card"      => pay with the saved card
+  //   - "Proceed to Payment" => generic checkout (card) fallback
   // Preference order per user: use balance if available, else card.
   const PAY_LABELS = ['Confirm Booking', 'Use your card', 'Proceed to Payment'];
   let clicked = null;
@@ -313,15 +318,21 @@ async function checkout(page, dateStr, dryRun) {
   await shot(page, '05-payment-late');
   return 'paid-unverified';
 }
+
 (async () => {
   fs.mkdirSync(OUT_DIR, { recursive: true });
   if (!process.env.CLUB_USER || !process.env.CLUB_PASS) throw new Error('CLUB_USER/CLUB_PASS not set');
   const dryRun = process.env.DRY_RUN === '1';
   const waitlistOk = process.env.WAITLIST_OK === '1';
-  const abortMin = +(process.env.POLL_ABORT_MIN || 75);
-  const target = computeTarget();
-  const dateStr = rowDateString(target);
-  log(`Target session: "${CLASS_NAME}" on ${dateStr} 10:00 | dryRun=${dryRun} waitlistOk=${waitlistOk}`);
+  const wanted = targetDateStrings();
+  log(`Scan: "${CLASS_NAME}" | targets: ${wanted.join(' | ') || '(none)'} | dryRun=${dryRun} waitlistOk=${waitlistOk}`);
+
+  const booked = [];        // newly booked this run
+  const waitlisted = [];    // newly joined waiting list this run
+  const already = [];       // already booked / already on waitlist
+  const unavailable = [];   // full / not open / not listed yet
+  const errors = [];        // real failures
+
   const browser = await chromium.launch({ args: ['--disable-blink-features=AutomationControlled'] });
   const ctx = await browser.newContext({
     viewport: { width: 1400, height: 1000 },
@@ -332,105 +343,80 @@ async function checkout(page, dateStr, dryRun) {
   try {
     await login(page);
     await emptyBasketIfNeeded(page);
-    await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 45000 });
-    await page.waitForTimeout(1500);
-    await shot(page, '02-list');
-    // -------- poll loop --------
-    let attempt = 0;
-    let result = null;
-    let waitlisted = false;   // VERIFIED waiting-list registration exists
-    let wlJoinTries = 0;
-    // Deadline: abortMin past the *relevant* midnight. If we start just after
-    // midnight (late backup run), count from the midnight that already passed;
-    // always allow at least 5 minutes of polling.
-    const s0 = secsToMidnightLondon();
-    const sinceMidnight = 86400 - s0;
-    let deadlineMs = s0 > 43200
-      ? (abortMin * 60 - sinceMidnight) * 1000   // past midnight already
-      : (s0 + abortMin * 60) * 1000;             // midnight still ahead
-    deadlineMs = Math.max(deadlineMs, 5 * 60 * 1000);
-    const deadline = Date.now() + deadlineMs;
-    while (Date.now() < deadline) {
-      attempt++;
-      const { state, row, text } = await rowState(page, dateStr);
-      const toMid = secsToMidnightLondon();
-      log(`#${attempt} state=${state} (${toMid}s to London midnight)`);
-      if (state === 'signedup') { result = waitlisted ? 'promoted-from-waitlist' : 'already-booked'; break; }
-      if (dryRun && state === 'on-waitlist') { log('DRY RUN: already on the waiting list - stopping.'); result = 'dry-run-ok'; break; }
+
+    for (const dateStr of wanted) {
+      // Fresh list load before each target (a prior booking navigated away).
+      await loadListCovering(page, [dateStr]);
+      const { state, row } = await rowState(page, dateStr);
+      log(`Target ${dateStr}: state=${state}`);
+
+      if (state === 'signedup')      { already.push(`${dateStr} (booked)`);   continue; }
+      if (state === 'on-waitlist')   { already.push(`${dateStr} (waitlist)`); continue; }
+      if (state === 'missing' || state === 'notopen') { unavailable.push(`${dateStr} (not open yet)`); continue; }
+
       if (state === 'book') {
-        log('BOOK button present — booking now');
+        log(`  BOOK available — booking ${dateStr}`);
         await jsClickInRow(row, 'span.onenter', /^\s*Book\s*$/);
-        for (let tryNo = 1; tryNo <= 2 && !result; tryNo++) {
+        let outcome = null;
+        for (let tryNo = 1; tryNo <= 2 && !outcome; tryNo++) {
           try {
-            result = await checkout(page, dateStr, dryRun);
+            outcome = await checkout(page, dateStr, dryRun);
           } catch (e) {
-            log(`Checkout attempt ${tryNo} error:`, e.message);
-            await shot(page, `err-checkout-${tryNo}`);
+            log(`  Checkout attempt ${tryNo} error:`, e.message);
+            await shot(page, `err-checkout-${dateStr.replace(/\W+/g, '_')}-${tryNo}`);
             if (tryNo === 1) {
-              // item should still be in the basket — reload it and retry once
               try { await page.goto(KURV, { waitUntil: 'domcontentloaded', timeout: 45000 }); await page.waitForTimeout(1500); } catch {}
             } else {
-              result = 'checkout-failed';
+              outcome = 'checkout-failed';
             }
           }
         }
-        break;
+        if (outcome === 'paid' || outcome === 'paid-unverified') booked.push(dateStr);
+        else if (outcome === 'dry-run-ok') booked.push(`${dateStr} (dry-run)`);
+        else errors.push(`${dateStr}: ${outcome}`);
+        continue;
       }
-      if (state === 'on-waitlist' && !waitlisted) {
-        log('Waiting-list registration confirmed — will keep watching for a freed spot');
-        waitlisted = true;
-        await shot(page, '04-waitlist-verified');
-      }
-      if (state === 'waitlist' && !waitlisted) {
-        if (dryRun) { log('DRY RUN: session is full; would join waiting list. Stopping.'); result = 'dry-run-ok'; break; }
-        if (!waitlistOk) { log('Session full and WAITLIST_OK not set — giving up'); result = 'full'; break; }
-        if (wlJoinTries >= 2) { result = 'waitlist-join-FAILED'; break; }
-        wlJoinTries++;
-        log(`Session full — joining waiting list (attempt ${wlJoinTries})`);
-        const st = await joinWaitlist(page, row, dateStr);
-        log('Waitlist dialog:', st);
-        await shot(page, `03-waitlist-join-${wlJoinTries}`);
-        // verification happens on the next iteration's fresh page load
-      }
-      if (state === 'missing') {
-        log('WARN: target row not found in list');
-        // Session still not even listed well after midnight => never published
-        // for this date. Stop cleanly instead of polling (and failing) for hours.
-        const sinceMid = 86400 - toMid;
-        if (sinceMid > 600 && sinceMid < 5400) {
-          log(`Target session still not listed ${Math.round(sinceMid / 60)} min after midnight — not published; stopping.`);
-          result = 'session-not-listed';
-          break;
+
+      if (state === 'full' || state === 'waitlist') {
+        if (state === 'waitlist' && waitlistOk && !dryRun) {
+          log(`  Session full — joining waiting list for ${dateStr}`);
+          const st = await joinWaitlist(page, row, dateStr);
+          log('  Waitlist result:', st);
+          if (st === 'paid' || st === 'paid-unverified') waitlisted.push(dateStr);
+          else errors.push(`${dateStr}: waitlist ${st}`);
+        } else {
+          unavailable.push(`${dateStr} (full)`);
         }
+        continue;
       }
-      if (dryRun && state === 'notopen') {
-        log('DRY RUN: registration for the target session is not open yet — stopping here (login, basket check and session detection all verified).');
-        result = 'dry-run-ok';
-        break;
-      }
-      // Adaptive polling: tight just before midnight, churn-watch just after it
-      let wait;
-      if (toMid <= 30) wait = 1;                    // final seconds: hammer it
-      else if (toMid <= 90) wait = 3;
-      else if (toMid <= 600) wait = 15;
-      else if (toMid > 43200) wait = 10;            // past midnight: watch for freed spots
-      else wait = 60;                               // long pre-midnight wait
-      await page.waitForTimeout(wait * 1000);
-      try {
-        await page.goto(BASE, { waitUntil: 'domcontentloaded', timeout: 45000 });
-        await page.waitForTimeout(wait <= 3 ? 300 : 1200);
-      } catch (e) { log('reload failed, retrying:', e.message); }
     }
-    if (!result) result = waitlisted ? 'waitlist-joined' : 'gave-up';
-    log('RESULT:', result);
-    fs.writeFileSync(`${OUT_DIR}/result.txt`, `${result}\n${CLASS_NAME} ${dateStr}\n`);
-    const ok = ['paid', 'paid-unverified', 'dry-run-ok', 'already-booked', 'promoted-from-waitlist', 'waitlist-joined', 'session-not-listed'].includes(result);
+
+    // ---- summarise ----
+    const lines = [];
+    lines.push(`booked: ${booked.length ? booked.join(', ') : 'none'}`);
+    if (waitlisted.length) lines.push(`waitlisted: ${waitlisted.join(', ')}`);
+    if (already.length)    lines.push(`already had: ${already.join(', ')}`);
+    if (unavailable.length) lines.push(`not bookable: ${unavailable.join(', ')}`);
+    if (errors.length)     lines.push(`errors: ${errors.join(', ')}`);
+    const summary = lines.join('\n');
+    log('SUMMARY:\n' + summary);
+
+    // First line is a machine-readable status for the notify step:
+    //   NOTIFY  -> something worth an email happened (a booking, or an error)
+    //   QUIET   -> nothing new; no email
+    const noteworthy = booked.length > 0 || waitlisted.length > 0 || errors.length > 0;
+    const status = noteworthy
+      ? `NOTIFY ${errors.length ? 'ERROR' : 'BOOKED'}`
+      : 'QUIET';
+    fs.writeFileSync(`${OUT_DIR}/result.txt`, `${status}\n${summary}\n`);
+
     await browser.close();
-    process.exit(ok ? 0 : 1);
+    // Only fail the run on a REAL error, so "nothing to book" never emails a failure.
+    process.exit(errors.length ? 1 : 0);
   } catch (e) {
     log('FATAL:', e.message);
     await shot(page, 'err-fatal');
-    fs.writeFileSync(`${OUT_DIR}/result.txt`, `fatal: ${e.message}\n`);
+    fs.writeFileSync(`${OUT_DIR}/result.txt`, `NOTIFY ERROR\nfatal: ${e.message}\n`);
     await browser.close();
     process.exit(1);
   }
