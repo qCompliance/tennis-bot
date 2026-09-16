@@ -3,17 +3,18 @@ name: Tennis session auto-registration
 
 on:
   schedule:
-    # Tuesday & Thursday night runs. GitHub's scheduler can start jobs HOURS late
-    # under load (observed ~2h20m on 2026-08-07, which pushed the run past midnight
-    # and lost the session). Defence: fire several evening windows so at least one
-    # run is already sitting in its midnight-wait even if GitHub is 2+ hours behind.
-    # The concurrency lock below serialises them, so only the FIRST run books; the
-    # rest start after midnight, see "already registered", and exit — no double-book.
-    # (Times are UTC; London is BST/UTC+1 in summer.)
-    - cron: '0 19 * * 2,4'   # ~20:00 London — earliest guard against late scheduling
-    - cron: '0 20 * * 2,4'   # ~21:00 London
-    - cron: '0 21 * * 2,4'   # ~22:00 London
-    - cron: '30 22 * * 2,4'  # ~23:30 London — last window before midnight
+    # Wed & Fri MORNING runs. Registration opens 10:00 London, 7 days before each
+    # 10:00 session, so we fire on the same weekday as the session, before 10:00.
+    # GitHub's scheduler can start jobs hours late, so we fire several morning
+    # windows; each waits for the 10:00 open (secsToMidnightLondon now targets 10:00)
+    # and tightens polling right around it. The concurrency lock serialises them, so
+    # only the FIRST run books; the rest exit as "already registered" — no double-book.
+    # (Times are UTC; London is BST/UTC+1 in summer, GMT in winter — the script
+    # computes the real 10:00 London moment either way.)
+    - cron: '0 5 * * 3,5'    # ~06:00 London — earliest guard against late scheduling
+    - cron: '0 6 * * 3,5'    # ~07:00 London
+    - cron: '0 7 * * 3,5'    # ~08:00 London
+    - cron: '0 8 * * 3,5'    # ~09:00 London — last window before the 10:00 open
   workflow_dispatch:
     inputs:
       dry_run:
