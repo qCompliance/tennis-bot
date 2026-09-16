@@ -58,9 +58,10 @@ function computeTarget() {
   if (envTarget === 'wed') wantedDay = 'Wed';
   else if (envTarget === 'fri') wantedDay = 'Fri';
   else {
-    // auto: Tue (or early-hours Wed) run -> Wed session; Thu (or early-hours Fri) run -> Fri
-    if (now.weekday === 'Tue' || (now.weekday === 'Wed' && now.hh < 6)) wantedDay = 'Wed';
-    else if (now.weekday === 'Thu' || (now.weekday === 'Fri' && now.hh < 6)) wantedDay = 'Fri';
+    // auto: registration opens 10:00 the SAME weekday, 7 days before the session,
+    // so a Wed-morning run books the next Wed and a Fri-morning run books the next Fri.
+    if (now.weekday === 'Wed') wantedDay = 'Wed';
+    else if (now.weekday === 'Fri') wantedDay = 'Fri';
     else throw new Error(`TARGET=auto but today (${now.weekday} London) is not a scheduled run day`);
   }
   // The newly-openable session is the wantedDay that lies 7 or 8 days ahead
@@ -81,8 +82,14 @@ function computeTarget() {
 const rowDateString = t => `${t.weekday} ${t.d}. ${MONTHS[t.m - 1]} ${t.y}`;
 /** Seconds until next midnight in Europe/London (approx, wall-clock based). */
 function secsToMidnightLondon() {
+  // NOTE: despite the name, returns seconds until the next 10:00 London — the
+  // moment club registration opens (7 days before each 10:00 session). Keeping the
+  // name lets the poll loop, deadline and grace logic re-anchor to the 10:00 open.
+  const OPEN_HH = 10;
   const n = londonNow();
-  return ((23 - n.hh) * 3600) + ((59 - n.mm) * 60) + (60 - n.ss);
+  let s = ((OPEN_HH - 1 - n.hh) * 3600) + ((59 - n.mm) * 60) + (60 - n.ss);
+  if (s <= 0) s += 86400;
+  return s;
 }
 // ---------- page helpers ----------
 async function shot(page, name) {
