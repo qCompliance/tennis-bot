@@ -3,12 +3,16 @@ name: Tennis session auto-registration
 
 on:
   schedule:
-    # Sessions here become bookable ~2 weeks ahead (NOT in a seconds-long window),
-    # and the soonest popular one fills over a day or two. So we don't race an
-    # "opening" — we just scan every couple of hours and grab any target Wed/Fri
-    # Level 3 session that is currently bookable and not already booked.
-    # (Every 2 hours, every day. Times are UTC.)
-    - cron: '0 */2 * * *'
+    # Booking opens 7 days before each session (SAME weekday) — so Wed sessions
+    # open on a Wednesday and Fri sessions on a Friday — around midday, and the
+    # popular Level 3 sessions sell out fast. We fire several staggered starts on
+    # Wed & Fri; each runs in WATCH mode, polling every ~15s and grabbing the
+    # session the instant it opens (and logging the exact open time). The
+    # concurrency lock serialises them, and each exits as soon as the day's
+    # opening is resolved, so they don't pile up. (Times are UTC.)
+    - cron: '0 6 * * 3,5'    # ~07:00 London — early guard against GitHub delay
+    - cron: '0 8 * * 3,5'    # ~09:00 London
+    - cron: '0 10 * * 3,5'   # ~11:00 London — covers a midday open even if delayed
   workflow_dispatch:
     inputs:
       dry_run:
@@ -20,6 +24,10 @@ on:
         type: choice
         options: [both, wed, fri]
         default: both
+      watch:
+        description: 'Watch/poll mode (keep checking until the open session is grabbed)'
+        type: boolean
+        default: false
       waitlist_ok:
         description: 'If a target session is already full, join its waiting list (refundable fee)'
         type: boolean
@@ -36,7 +44,7 @@ concurrency:
 jobs:
   book:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +62,8 @@ jobs:
         env:
           CLUB_USER: ${{ secrets.CLUB_USER }}
           CLUB_PASS: ${{ secrets.CLUB_PASS }}
+          WATCH: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.watch)) && '1' || '' }}
+          WATCH_MINUTES: '300'
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '1' || '' }}
           TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'both' }}
           WAITLIST_OK: ${{ github.event_name == 'workflow_dispatch' && inputs.waitlist_ok && '1' || '' }}
@@ -78,8 +88,6 @@ jobs:
             const jobOk = '${{ job.status }}' === 'success';
             const isError  = firstLine.startsWith('NOTIFY ERROR') || !jobOk;
             const isBooked = firstLine.startsWith('NOTIFY BOOKED');
-            // Email ONLY when a booking happened or a real error occurred.
-            // "Nothing to book" runs stay silent — no more false-failure spam.
             if (!isError && !isBooked) { core.info('Nothing noteworthy — no issue created.'); return; }
             const emoji = isError ? '❌' : '✅';
             const word  = isError ? 'needs attention' : 'booked a session';
