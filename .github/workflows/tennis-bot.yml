@@ -4,15 +4,15 @@ name: Tennis session auto-registration
 on:
   schedule:
     # We only book FRIDAY sessions. Booking opens 7 days before each session
-    # (same weekday) — so a Fri session opens on a Friday — around midday, and the
-    # popular Level 3 sessions sell out fast. We fire several staggered starts on
-    # FRIDAYS; each runs in WATCH mode, polling every ~15s and grabbing the
-    # session the instant it opens (and logging the exact open time). The
-    # concurrency lock serialises them, and each exits as soon as the day's
-    # opening is resolved, so they don't pile up. (Times are UTC.)
-    - cron: '0 6 * * 5'    # ~07:00 London — early guard against GitHub delay
-    - cron: '0 8 * * 5'    # ~09:00 London
-    - cron: '0 10 * * 5'   # ~11:00 London — covers a midday open even if delayed
+    # (same weekday) at ~10:00 London and sells out within minutes, so a watcher
+    # MUST already be polling before 10:00. GitHub's scheduler can run jobs late,
+    # so we start several hours early, at off-peak minutes (:37, not :00, to dodge
+    # top-of-hour load), each in WATCH mode polling every ~15s through the open.
+    # The concurrency lock serialises them and each exits once the day's opening is
+    # resolved. 10:00 London = 09:00 UTC (BST) / 10:00 UTC (GMT). (Times are UTC.)
+    - cron: '37 6 * * 5'    # ~07:37 London (BST) — early start, long poll
+    - cron: '37 7 * * 5'    # ~08:37 London
+    - cron: '37 8 * * 5'    # ~09:37 London — backup if earlier starts were delayed
   workflow_dispatch:
     inputs:
       dry_run:
