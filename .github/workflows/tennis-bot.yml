@@ -43,7 +43,10 @@ concurrency:
 
 jobs:
   book:
-    runs-on: ubuntu-latest
+    # Pinned to ubuntu-24.04: ubuntu-latest migrated to Ubuntu 26.04 (Oct 2026),
+    # which Playwright 1.56.0 does not support (browser install fails). 24.04 is
+    # supported and stable. Revisit if we later upgrade Playwright.
+    runs-on: ubuntu-24.04
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
@@ -75,6 +78,7 @@ jobs:
         with:
           name: run-${{ github.run_id }}
           path: out/
+          if-no-files-found: ignore
 
       - name: Notify by issue (GitHub emails you) — only when noteworthy
         if: always()
